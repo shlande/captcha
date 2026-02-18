@@ -1,81 +1,85 @@
-name: Build and Push Docker Image
+name: Docker Build and Publish (Multi-Arch)
 
 on:
   push:
-    branches:
-      - main
-      - master
-    tags:
-      - 'v*.*.*'
+    branches: [ main, master ]
+    tags: [ 'v*.*.*' ]
   pull_request:
-    branches:
-      - main
-      - master
+    branches: [ main, master ]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # ============================================================================
+  # Job 1: Calculate unified version for Docker image and Helm chart
+  # ============================================================================
   version:
-    name: Calculate Version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      is_tag: ${{ steps.version.outputs.is_tag }}
+      version: ${{ steps.calculate.outputs.version }}
+      chart_version: ${{ steps.calculate.outputs.chart_version }}
+      image_tag: ${{ steps.calculate.outputs.image_tag }}
+      is_tag: ${{ steps.calculate.outputs.is_tag }}
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Calculate version
-        id: version
+        id: calculate
         run: |
-          if [[ ${{ github.ref }} == 'refs/tags/v*.*.*' ]]; then
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             VERSION=${GITHUB_REF#refs/tags/v}
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-            echo "is_tag=true" >> $GITHUB_OUTPUT
+            IS_TAG="true"
           else
-            SHA_SHORT=${GITHUB_SHA:0:7}
-            VERSION="0.0.0-$SHA_SHORT"
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-            echo "is_tag=false" >> $GITHUB_OUTPUT
+            BASE_VERSION=$(grep '^version:' charts/captcha/Chart.yaml | awk '{print $2}')
+            BRANCH_NAME=${GITHUB_REF#refs/heads/}
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            SAFE_BRANCH=$(echo "${BRANCH_NAME}" | sed 's/[\/_]/-/g')
+            VERSION="${BASE_VERSION}-${SAFE_BRANCH}.${SHORT_SHA}"
+            IS_TAG="false"
           fi
+          CHART_VERSION="${VERSION}"
+          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "chart_version=${CHART_VERSION}" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "is_tag=${IS_TAG}" >> $GITHUB_OUTPUT
+          echo "Version: ${VERSION}"
 
+  # ============================================================================
+  # Job 2: Build multi-arch Docker images (amd64, arm64)
+  # ============================================================================
   build:
-    name: Build Docker Image
-    runs-on: ubuntu-latest
-    needs: version
+    runs-on: ${{ matrix.runner }}
+    needs: [version]
     strategy:
+      fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Container Registry
-        if: github.event_name != 'pull_request'
+      - name: Login to registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=sha,prefix=
 
       - name: Build and push image
         id: build
@@ -87,111 +91,214 @@ jobs:
           push: true
           provenance: false
 
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/${{ matrix.arch }}"
+          echo "Exported digest for ${{ matrix.arch }}: ${{ steps.build.outputs.digest }}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ============================================================================
+  # Job 3: Create multi-arch manifest and sign images
+  # ============================================================================
   manifest:
-    name: Create Docker Manifest
     runs-on: ubuntu-latest
-    needs: [version, build]
+    needs: [build, version]
+    if: github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: write
       id-token: write
+    outputs:
+      image_tag: ${{ needs.version.outputs.image_tag }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
 
-      - name: Log in to Container Registry
+      - name: Login to registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          SOURCES=""
+          for digest_file in *; do
+            digest=$(cat "$digest_file")
+            SOURCES="${SOURCES} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${digest}"
+          done
+          echo "Creating manifest: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}"
+          docker buildx imagetools create \
+            -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}" \
+            ${SOURCES}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=sha,prefix=
+          cosign-release: 'v2.2.0'
 
-      - name: Create manifest list
+      - name: Sign images
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
-          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}"
-          docker manifest create $IMAGE_TAG \
-            $IMAGE_TAG-amd64 \
-            $IMAGE_TAG-arm64
+          DIGEST_AMD64="$(cat /tmp/digests/amd64)"
+          DIGEST_ARM64="$(cat /tmp/digests/arm64)"
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}@${DIGEST_AMD64}" || true
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}@${DIGEST_ARM64}" || true
 
-      - name: Push manifest
-        run: |
-          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
-
+  # ============================================================================
+  # Job 4: Package and publish Helm chart to GHCR OCI registry
+  # ============================================================================
   helm-publish:
-    name: Publish Helm Chart
     runs-on: ubuntu-latest
-    needs: [version, manifest]
-    if: needs.version.outputs.is_tag == 'true'
+    needs: [manifest, version]
+    if: github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: write
+    outputs:
+      chart_version: ${{ needs.version.outputs.chart_version }}
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure Git user
-        run: |
-          git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor }}@users.noreply.github.com"
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
 
-      - name: Package Helm chart
-        run: |
-          helm package charts/captcha --version ${{ needs.version.outputs.version }} --app-version ${{ needs.version.outputs.version }}
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish Helm chart to GHCR
+      - name: Package Helm Chart
         run: |
-          helm push captcha-${{ needs.version.outputs.version }}.tgz oci://${{ env.REGISTRY }}/${{ github.repository }}/helm
+          helm package charts/captcha \
+            --version "${{ needs.version.outputs.chart_version }}" \
+            --app-version "${{ needs.version.outputs.chart_version }}"
 
+      - name: Push Helm Chart to GHCR
+        run: |
+          PACKAGE_FILE=$(ls captcha-*.tgz | head -1)
+          helm push "${PACKAGE_FILE}" oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts
+
+      - name: Upload chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart-${{ needs.version.outputs.chart_version }}
+          path: "*.tgz"
+          retention-days: 30
+
+  # ============================================================================
+  # Job 5: Deploy to Kubernetes (only on tag push)
+  # ============================================================================
   deploy:
-    name: Deploy to Kubernetes
     runs-on: ubuntu-latest
-    needs: [version, helm-publish]
-    if: needs.version.outputs.is_tag == 'true' && github.event_name == 'push' && github.ref == 'refs/tags/v*.*.*'
-    environment:
-      name: production
-      url: ${{ vars.KUBE_NAMESPACE != '' && 'https://' || '' }}
+    needs: [manifest, helm-publish, version]
+    if: github.event_name != 'pull_request'
+    environment: production
+    env:
+      CHART_VERSION: ${{ needs.version.outputs.chart_version }}
+      NAMESPACE: ${{ vars.KUBE_NAMESPACE || 'captcha' }}
+      HELM_VALUES: ${{ vars.HELM_VALUES }}
+      EXTRA_HOSTS: ${{ vars.EXTRA_HOSTS || '' }}
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download Helm chart
-        run: |
-          helm package charts/captcha --version ${{ needs.version.outputs.version }} --app-version ${{ needs.version.outputs.version }}
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.28.0'
 
-      - name: Deploy to Kubernetes
-        env:
-          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
-          NAMESPACE: ${{ vars.KUBE_NAMESPACE || 'captcha' }}
-        run: |
-          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
-          kubectl --kubeconfig=kubeconfig config set-cluster kubernetes --server=${{ vars.KUBE_SERVER || 'https://kubernetes.docker.internal:6443' }}
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
 
-          if helm --kubeconfig=kubeconfig list -n $NAMESPACE | grep -q captcha; then
-            helm --kubeconfig=kubeconfig upgrade captcha ./captcha-${{ needs.version.outputs.version }}.tgz \
-              --namespace $NAMESPACE \
-              --set image.tag=${{ needs.version.outputs.version }} \
-              --wait --timeout 5m
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > /tmp/kubeconfig
+          chmod 600 /tmp/kubeconfig
+          export KUBECONFIG=/tmp/kubeconfig
+
+      - name: Configure hosts
+        if: env.EXTRA_HOSTS != ''
+        run: |
+          # EXTRA_HOSTS format: "IP1:hostname1,IP2:hostname2"
+          IFS=',' read -ra HOST_ENTRIES <<< "$EXTRA_HOSTS"
+          for entry in "${HOST_ENTRIES[@]}"; do
+            IFS=':' read -r ip hostname <<< "$entry"
+            if [ -n "$ip" ] && [ -n "$hostname" ]; then
+              echo "Adding host mapping: $ip -> $hostname"
+              echo "$ip $hostname" | sudo tee -a /etc/hosts
+            fi
+          done
+          echo "Current hosts file:"
+          cat /etc/hosts | grep -v "^#" | grep -v "^$" | tail -20
+
+      - name: Prepare Helm values
+        run: |
+          if [ -z "$HELM_VALUES" ]; then
+            cat > /tmp/values.yaml << 'EOF'
+image:
+  tag: "${CHART_VERSION}"
+EOF
           else
-            helm --kubeconfig=kubeconfig install captcha ./captcha-${{ needs.version.outputs.version }}.tgz \
-              --namespace $NAMESPACE \
-              --set image.tag=${{ needs.version.outputs.version }} \
-              --wait --timeout 5m
+            echo "$HELM_VALUES" | base64 -d > /tmp/values.yaml
+            sed -i "s/^  tag:.*$/  tag: \"${CHART_VERSION}\"/" /tmp/values.yaml
           fi
+          echo "Values prepared:"
+          cat /tmp/values.yaml
+
+      - name: Deploy with Helm
+        run: |
+          export KUBECONFIG=/tmp/kubeconfig
+          echo "Deploying to namespace: ${NAMESPACE}"
+          helm upgrade --install captcha \
+            oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/captcha \
+            --version ${CHART_VERSION} \
+            --namespace ${NAMESPACE} \
+            --create-namespace \
+            -f /tmp/values.yaml \
+            --wait --timeout 300s
 
       - name: Verify deployment
-        env:
-          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
-          NAMESPACE: ${{ vars.KUBE_NAMESPACE || 'captcha' }}
         run: |
-          echo "$KUBE_CONFIG" | base64 -d > kubeconfig
-          kubectl --kubeconfig=kubeconfig rollout status deployment/captcha -n $NAMESPACE
+          export KUBECONFIG=/tmp/kubeconfig
+          helm list -n "${NAMESPACE}"
+          kubectl get deployments -n "${NAMESPACE}"
+          kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=captcha
+          kubectl get svc -n "${NAMESPACE}"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f /tmp/kubeconfig /tmp/values.yaml
