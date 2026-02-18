@@ -80,7 +80,9 @@ jobs:
           context: .
           platforms: linux/${{ matrix.arch }}
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}-${matrix.arch}
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -113,13 +115,14 @@ jobs:
 
       - name: Create manifest list
         run: |
-          docker manifest create ${{ steps.meta.outputs.tags }} \
-            ${{ steps.meta.outputs.tags }}-amd64 \
-            ${{ steps.meta.outputs.tags }}-arm64
+          IMAGE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}"
+          docker manifest create $IMAGE_TAG \
+            $IMAGE_TAG-amd64 \
+            $IMAGE_TAG-arm64
 
       - name: Push manifest
         run: |
-          docker manifest push ${{ steps.meta.outputs.tags }}
+          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
 
   helm-publish:
     name: Publish Helm Chart
