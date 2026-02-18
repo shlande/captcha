@@ -1,0 +1,18 @@
+Thank you for installing {{ .Chart.Name }}.
+
+Your release is named {{ .Release.Name }}.
+
+To learn more about the release, try:
+
+  $ helm status {{ .Release.Name }}
+  $ helm get all {{ .Release.Name }}
+
+To learn more about Kubernetes deployment, try:
+
+  $ kubectl get all -l "app.kubernetes.io/instance={{ .Release.Name }}"
+
+To connect to the gRPC service:
+
+  $ kubectl port-forward svc/{{ include "captcha.fullname" . }} {{ .Values.service.grpc.port }}:{{ .Values.service.grpc.port }}
+
+Then connect to localhost:{{ .Values.service.grpc.port }} using your gRPC client.

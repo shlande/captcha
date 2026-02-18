@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package captcha.v1;
+
+option go_package = "captcha/api/captcha/v1";
+
+service CaptchaService {
+    // 验证验证码 token
+    rpc Verify(VerifyRequest) returns (VerifyResponse);
+    
+    // 获取支持的 Provider 列表
+    rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+}
+
+message VerifyRequest {
+    string provider = 1;            // 验证服务提供方（如 cloudflare）
+    string token = 2;              // 用户验证完成的 token
+    string remote_ip = 3;          // 用户 IP 地址（可选）
+    map<string, string> extra = 4; // 额外参数（如 action, cdata 等）
+}
+
+message VerifyResponse {
+    bool success = 1;
+    string provider = 2;
+    ValidationResult result = 3;
+    Error error = 4;
+}
+
+message ValidationResult {
+    bool success = 1;
+    string challenge_ts = 2;       // ISO 8601 时间戳
+    string hostname = 3;
+    string action = 4;
+    string cdata = 5;
+    repeated string error_codes = 6;
+    map<string, string> metadata = 7;
+}
+
+message Error {
+    string code = 1;
+    string message = 2;
+    repeated string details = 3;
+}
+
+message ListProvidersRequest {}
+
+message ListProvidersResponse {
+    repeated string providers = 1;
+}

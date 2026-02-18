@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "captcha.fullname" . }}
+  labels:
+    {{ include "captcha.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    server:
+      host: "{{ .Values.config.server.host }}"
+      port: {{ .Values.config.server.port }}
+    providers:
+      cloudflare:
+        enabled: {{ .Values.config.providers.cloudflare.enabled }}
+        secret_key: ""
+        timeout: "{{ .Values.config.providers.cloudflare.timeout }}"
