@@ -74,18 +74,15 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,prefix=
 
-      - name: Build and push Docker image
+      - name: Build and push image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/${{ matrix.arch }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: |
-            ${{ steps.meta.outputs.tags }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+          push: true
+          provenance: false
 
   manifest:
     name: Create Docker Manifest
