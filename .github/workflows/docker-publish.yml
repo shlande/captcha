@@ -268,10 +268,7 @@ jobs:
       - name: Prepare Helm values
         run: |
           if [ -z "$HELM_VALUES" ]; then
-            cat > /tmp/values.yaml << 'EOF'
-image:
-  tag: "${CHART_VERSION}"
-EOF
+            printf 'image:\n  tag: "%s"\n' "${CHART_VERSION}" > /tmp/values.yaml
           else
             echo "$HELM_VALUES" | base64 -d > /tmp/values.yaml
             sed -i "s/^  tag:.*$/  tag: \"${CHART_VERSION}\"/" /tmp/values.yaml
